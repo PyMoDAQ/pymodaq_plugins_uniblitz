@@ -1,25 +1,33 @@
-from pymodaq.control_modules.move_utility_classes import DAQ_Move_base, comon_parameters_fun, main, DataActuatorType,\
-    DataActuator  # common set of parameters for all actuators
-from pymodaq.utils.daq_utils import ThreadCommand # object used to send info back to the main thread
-from pymodaq.utils.parameter import Parameter
-import serial
+from typing import Union, List, Dict
+from pymodaq.control_modules.move_utility_classes import (DAQ_Move_base, comon_parameters_fun,
+                                                          main, DataActuatorType, DataActuator)
+from pymodaq_utils.utils import ThreadCommand  # object used to send info back to the main thread
+from pymodaq_gui.parameter import Parameter
+
+from serial import Serial
 from serial.tools import list_ports
 
 
-
 class DAQ_Move_VLM1(DAQ_Move_base):
+    """ Instrument plugin class for VLM1 Shutter Controller.
+    
+    It uses the serial module to send one of two simple commands. Doesn't require any special driver.
+    Position 0 is closed, 1 is open. Any move command to a nonzero position will default to 1.
 
-    _controller_units = 'whatever'
+    Attributes:
+    -----------
+    controller: object
+        The particular object that allow the communication with the hardware, in general a python wrapper around the
+         hardware library.
+
+    """
     is_multiaxes = False
-
-    _axis_names = ['Shutter']
-    _epsilon = 0.1
-    data_actuator_type = DataActuatorType['DataActuator']  # wether you use the new data style for actuator otherwise set this
-    # as  DataActuatorType['float']  (or entirely remove the line)
+    _axis_names: Union[List[str], Dict[str, int]] = ['Status']
+    _controller_units: Union[str, List[str]] = ''
+    _epsilon: Union[float, List[float]] = 0.1
+    data_actuator_type = DataActuatorType.DataActuator
 
     COMports = [COMport.device for COMport in list_ports.comports()]
-    isOpened = False
-    button = False
 
     if len(COMports) > 0:
         if 'COM10' in COMports:
@@ -28,50 +36,40 @@ class DAQ_Move_VLM1(DAQ_Move_base):
             COMport = COMports[0]
     else:
         COMport = None
-    stage_names = []
 
-    params = [   
-        {
-            'title': 'COM Port:',
-            'name': 'COM_port',
-            'type': 'list',
-            'limits': COMports,
-            'value': COMport
-        },
-                 ] + comon_parameters_fun(is_multiaxes, stage_names)
+    params = [{'title': 'COM Port:', 'name': 'COM_port', 'type': 'list', 'limits': COMports, 'value': COMport},
+                ] + comon_parameters_fun(is_multiaxes, axis_names=_axis_names, epsilon=_epsilon)
 
-    def __init__(self, parent=None, params_state=None):
-        super().__init__(parent, params_state)
-        self.controller = None
-        self.settings.child(('epsilon')).setValue(1)
-        self.settings.child('bounds', 'is_bounds').setValue(True)
-        self.settings.child('bounds', 'max_bound').setValue(1)
-        self.settings.child('bounds', 'min_bound').setValue(0)
-        self.current_position = 0
+    def ini_attributes(self):
+        self.controller: Serial = None
 
     def get_actuator_value(self):
-        """Not implemented yet.
+        """Get the current value from the hardware with scaling conversion.
+
+        Returns
+        -------
+        float: The position obtained after scaling conversion.
         """
-        pos = self.current_position     #The position it remembers, but does not check with the hardware.
+        pos = self.current_value
+        pos = self.get_position_with_scaling(pos)
         return pos
 
     def close(self):
-        """
-        Terminate the communication protocol
-        """
+        """Terminate the communication protocol"""
         if self.controller is not None:
             self.controller.close()
 
-    def commit_settings(self, param):
-        """
-            | Activate any parameter changes on the PI_GCS2 hardware.
-            |
-            | Called after a param_tree_changed signal from DAQ_Move_main.
+    def commit_settings(self, param: Parameter):
+        """Apply the consequences of a change of value in the detector settings
 
+        Parameters
+        ----------
+        param: Parameter
+            A given parameter (within detector_settings) whose value has been changed by the user
         """
-
         if param.name() == "COM_Port":
             self.close()
+            self.controller = Serial(param.value(), baudrate=9600)
         else:
             pass
 
@@ -89,46 +87,47 @@ class DAQ_Move_VLM1(DAQ_Move_base):
         initialized: bool
             False if initialization failed otherwise True
         """
+        self.ini_stage_init(slave_controller=controller)  # will be useful when controller is slave
 
-        try:
-            com_port = self.settings.child('COM_port').value()
-            self.controller = serial.Serial(com_port, baudrate=9600)
-            # logger.info('Shutter connected on port '+com_port)
+        if self.is_master:  # is needed when controller is master
+            self.controller = Serial(self.settings.child('COM_port').value(), baudrate=9600)
 
-
-            info = "Port ouvert"
-            initialized = True
-            return info, initialized
-        except Exception as e:
-            info = 'Initialisation failed'
-            initialized = False
-            return info, initialized
+        info = "Shutter connected on port "+str(self.settings.child('COM_port').value())
+        initialized = True
+        return info, initialized
 
     def move_abs(self, value: DataActuator):
-        if value > 0:
-            value = 1
-        else:
-            value = 0
-        self.controller.write([b'A', b'@'][int(value)])
-        self.current_position = int(value)
+        """ Move the actuator to the absolute target defined by value
+
+        Parameters
+        ----------
+        value: (float) value of the absolute target positioning
+        """
+
+        value = self.check_bound(value)  #if user checked bounds, the defined bounds are applied here
+        self.target_value = value
+        value = self.set_position_with_scaling(value)  # apply scaling if the user specified one
+
+        int_value = int(value > 0)
+        self.controller.write([b'A', b'@'][int_value])
+        self.current_value = int_value
 
     def move_rel(self, value: DataActuator):
-        if value > 0:
-            self.move_abs(1)
-        elif value <0:
-            self.move_abs(0)
+        """ Move the actuator to the relative target actuator value defined by value
+
+        Parameters
+        ----------
+        value: (float) value of the relative target positioning
+        """
+        self.move_abs(DataActuator(data=int(value.value() > 0)))
 
     def move_home(self):
         """Call the reference method of the controller"""
-        self.move_abs(0)
-        self.current_position = 0
+        self.move_abs(DataActuator(data=0))
+        self.current_value = 0
 
-
+    def stop_motion(self):
+        pass
 
 if __name__ == '__main__':
-    # main(__file__)
-    test = DAQ_Move_VLM1()
-    print(test.params)
-    test.ini_stage()
-    test.move_abs(0)
-    test.close()
+    main(__file__)
