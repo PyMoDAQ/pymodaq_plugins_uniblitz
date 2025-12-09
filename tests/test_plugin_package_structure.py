@@ -129,6 +129,6 @@ def test_compatibility(capsys):
     msg = '\n'.join(plugin.failed_imports + [''])
 
     if not success:
-        plugin.save_import_report(".")
+        plugin.save_import_report('.')
 
     assert success, msg
